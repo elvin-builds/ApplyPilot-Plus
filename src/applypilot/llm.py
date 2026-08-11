@@ -70,6 +70,7 @@ class LiteLLMExtra(TypedDict, total=False):
     tools: list[dict[str, Any]]
     tool_choice: str | dict[str, Any]
     fallbacks: list[str]
+    extra_body: dict[str, Any]
 
 
 def _env_get(env: Mapping[str, str], key: str) -> str:
@@ -169,6 +170,14 @@ class LLMClient:
         **extra: Unpack[LiteLLMExtra],
     ) -> str:
         """Send a completion request and return plain text content."""
+        # Xiaomi MiMo: disable thinking to ensure final text content is returned.
+        # MiMo requires this non-standard parameter inside extra_body.
+        if "xiaomimimo.com" in (self.config.api_base or ""):
+            extra.setdefault(
+                "extra_body",
+                {"thinking": {"type": "disabled"}},
+            )
+
         # Use streaming mode when configured (required by some LLM proxies)
         if self._use_streaming:
             return self._chat_streaming(
@@ -249,6 +258,7 @@ class LLMClient:
             if temperature is not None:
                 kwargs["temperature"] = temperature
 
+            kwargs.update(extra)
             response = litellm.completion(**kwargs)
 
             # Accumulate content from streaming chunks
