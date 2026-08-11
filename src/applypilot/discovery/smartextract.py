@@ -636,29 +636,14 @@ def judge_api_responses(api_responses: list[dict]) -> list[dict]:
         url = str(resp.get("url", "?"))
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
-        path = parsed.path or "/"
 
         if host and any(host == deny or host.endswith(f".{deny}") for deny in judge_denylist):
             log.info("Judge denylist: %s -> DROP", url[:80])
             continue
 
-        fields = ""
-        sample = ""
+        fields, sample = _judge_response_fields(resp)
         resp_type = resp.get("type", "unknown")
-        if "first_item_keys" in resp:
-            fields = str(resp["first_item_keys"])
-            sample = json.dumps(resp.get("first_item_sample", {}), indent=2)[:500]
-        elif "keys" in resp:
-            fields = str(resp["keys"])
-            for k, v in resp.items():
-                if k.startswith("nested_"):
-                    fields += f"\n  .{k.replace('nested_', '')}: {v.get('count', '?')} items, keys={v.get('first_item_keys', '?')}"
-                    sample = json.dumps(v.get("first_item_sample", {}), indent=2)[:500]
-        else:
-            fields = "no structured data"
-
-        fields_signature = hashlib.sha256(fields.encode("utf-8")).hexdigest()[:16]
-        cache_key = (host, path, fields_signature)
+        cache_key = _judge_cache_key(resp, fields)
         with _JUDGE_CACHE_LOCK:
             cached_verdict = _JUDGE_VERDICT_CACHE.get(cache_key)
         if cached_verdict is not None:
@@ -694,6 +679,33 @@ def judge_api_responses(api_responses: list[dict]) -> list[dict]:
             relevant.append(resp)
 
     return relevant
+
+
+def _judge_response_fields(resp: dict) -> tuple[str, str]:
+    """Build the (fields, sample) description strings for one API response."""
+    fields = ""
+    sample = ""
+    if "first_item_keys" in resp:
+        fields = str(resp["first_item_keys"])
+        sample = json.dumps(resp.get("first_item_sample", {}), indent=2)[:500]
+    elif "keys" in resp:
+        fields = str(resp["keys"])
+        for k, v in resp.items():
+            if k.startswith("nested_"):
+                fields += f"\n  .{k.replace('nested_', '')}: {v.get('count', '?')} items, keys={v.get('first_item_keys', '?')}"
+                sample = json.dumps(v.get("first_item_sample", {}), indent=2)[:500]
+    else:
+        fields = "no structured data"
+    return fields, sample
+
+
+def _judge_cache_key(resp: dict, fields: str) -> tuple[str, str, str]:
+    """Build the memo cache key: (host, path, fields signature)."""
+    parsed = urlparse(str(resp.get("url", "?")))
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or "/"
+    fields_signature = hashlib.sha256(fields.encode("utf-8")).hexdigest()[:16]
+    return host, path, fields_signature
 
 
 def _reset_judge_verdict_cache() -> None:

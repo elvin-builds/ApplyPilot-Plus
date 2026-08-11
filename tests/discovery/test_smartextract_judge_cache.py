@@ -1,6 +1,8 @@
 """Tests for smart extraction API response judge denylist and cache."""
 
+import json
 import os
+import subprocess
 import sys
 from unittest.mock import Mock, patch
 
@@ -13,6 +15,8 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from applypilot.discovery.smartextract import (
+    _judge_cache_key,
+    _judge_response_fields,
     _reset_judge_verdict_cache,
     judge_api_responses,
 )
@@ -172,3 +176,72 @@ def test_llm_exception_keeps_response_and_does_not_cache_failure():
     assert first_result == [response]
     assert second_result == []
     assert client.chat.call_count == 2
+
+
+def test_cache_key_is_stable_within_a_process():
+    response = _make_response(
+        "https://api.example.com/jobs?query=engineer",
+        first_item_keys=["title", "company"],
+        first_item_sample={"title": "Engineer", "company": "Example"},
+    )
+
+    fields, _ = _judge_response_fields(response)
+
+    assert _judge_cache_key(response, fields) == _judge_cache_key(response, fields)
+
+
+def test_cache_key_depends_on_structure_not_object_identity():
+    raw = json.dumps({
+        "url": "https://api.example.com/jobs?query=engineer",
+        "status": 200,
+        "size": 1234,
+        "type": "json",
+        "first_item_keys": ["title", "company"],
+        "first_item_sample": {"title": "Engineer", "company": "Example"},
+    })
+    response_one = json.loads(raw)
+    response_two = json.loads(raw)
+
+    fields_one, _ = _judge_response_fields(response_one)
+    fields_two, _ = _judge_response_fields(response_two)
+
+    assert _judge_cache_key(response_one, fields_one) == _judge_cache_key(response_two, fields_two)
+
+
+def test_cache_key_is_stable_across_python_hash_seeds():
+    # A seed-dependent key would silently prevent cross-process cache hits.
+    code = """
+import json
+from applypilot.discovery.smartextract import _judge_cache_key, _judge_response_fields
+
+response = json.loads('{\"url\": \"https://api.example.com/jobs?query=engineer\", \"status\": 200, \"size\": 1234, \"type\": \"json\", \"first_item_keys\": [\"title\", \"company\"], \"first_item_sample\": {\"title\": \"Engineer\", \"company\": \"Example\"}}')
+fields, _ = _judge_response_fields(response)
+print(_judge_cache_key(response, fields))
+""".strip()
+    keys = []
+
+    for seed in ("0", "1", "12345"):
+        env = {**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": SRC}
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        keys.append(result.stdout.strip())
+
+    assert keys[0] == keys[1] == keys[2]
+
+
+def test_judge_response_fields_preserves_list_stringification():
+    response = _make_response(
+        "https://api.example.com/jobs",
+        first_item_keys=["title", "company"],
+        first_item_sample={"title": "Engineer", "company": "Example"},
+    )
+
+    fields, _ = _judge_response_fields(response)
+
+    assert fields.startswith("[")
+    assert not fields.startswith("{")
