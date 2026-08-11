@@ -12,16 +12,18 @@ Sites are loaded from config/sites.yaml, with {query_encoded} and {location_enco
 placeholders replaced from the user's search configuration.
 """
 
+import hashlib
 import json
 import logging
 import re
 import sqlite3
 import sys
+import threading
 import time
-from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from datetime import datetime, timezone
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 import httpx
 import yaml
@@ -30,7 +32,7 @@ from playwright.sync_api import sync_playwright
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import init_db, get_stats
+from applypilot.database import get_stats, init_db
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -46,6 +48,11 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 _LENSA_MAX_PAGES = 10
 _LENSA_MIN_SALARY = 150_000
+_JUDGE_CACHE_LOCK = threading.Lock()
+# The lock intentionally protects only dict access. We accept occasional
+# duplicate concurrent judging of the same key to avoid serializing all
+# worker threads behind a slow LLM call.
+_JUDGE_VERDICT_CACHE: dict[tuple[str, str, str], tuple[bool, str]] = {}
 
 
 # -- Location filtering -------------------------------------------------------
@@ -555,9 +562,19 @@ def judge_api_responses(api_responses: list[dict]) -> list[dict]:
         return []
 
     client = get_client()
+    judge_denylist = [host.lower() for host in config.load_judge_denylist()]
     relevant: list[dict] = []
 
     for resp in api_responses:
+        url = str(resp.get("url", "?"))
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path or "/"
+
+        if host and any(host == deny or host.endswith(f".{deny}") for deny in judge_denylist):
+            log.info("Judge denylist: %s -> DROP", url[:80])
+            continue
+
         fields = ""
         sample = ""
         resp_type = resp.get("type", "unknown")
@@ -573,8 +590,20 @@ def judge_api_responses(api_responses: list[dict]) -> list[dict]:
         else:
             fields = "no structured data"
 
+        fields_signature = hashlib.sha256(fields.encode("utf-8")).hexdigest()[:16]
+        cache_key = (host, path, fields_signature)
+        with _JUDGE_CACHE_LOCK:
+            cached_verdict = _JUDGE_VERDICT_CACHE.get(cache_key)
+        if cached_verdict is not None:
+            is_relevant, reason = cached_verdict
+            log.info("Judge cache hit: %s -> %s (%s)", url[:80],
+                     "KEEP" if is_relevant else "DROP", reason)
+            if is_relevant:
+                relevant.append(resp)
+            continue
+
         prompt = JUDGE_PROMPT.format(
-            url=resp.get("url", "?")[:200],
+            url=url[:200],
             status=resp.get("status", "?"),
             size=resp.get("size", "?"),
             type=resp_type,
@@ -587,15 +616,23 @@ def judge_api_responses(api_responses: list[dict]) -> list[dict]:
             verdict = extract_json(raw)
             is_relevant = verdict.get("relevant", False)
             reason = verdict.get("reason", "?")
-            log.info("Judge: %s -> %s (%s)", resp.get("url", "?")[:80],
+            with _JUDGE_CACHE_LOCK:
+                _JUDGE_VERDICT_CACHE[cache_key] = (is_relevant, reason)
+            log.info("Judge: %s -> %s (%s)", url[:80],
                      "KEEP" if is_relevant else "DROP", reason)
             if is_relevant:
                 relevant.append(resp)
-        except Exception as e:
-            log.warning("Judge ERROR for %s: %s -- keeping", resp.get("url", "?")[:80], e)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Judge ERROR for %s: %s -- keeping", url[:80], e)
             relevant.append(resp)
 
     return relevant
+
+
+def _reset_judge_verdict_cache() -> None:
+    """Clear memoized judge verdicts for tests."""
+    with _JUDGE_CACHE_LOCK:
+        _JUDGE_VERDICT_CACHE.clear()
 
 
 # -- Phase 1: strategy selection ---------------------------------------------

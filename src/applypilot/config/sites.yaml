@@ -32,6 +32,19 @@ blocked_sso:
   - "auth0.com"
   - "sso.cisco.com"
 
+# ── Judge denylist — exact domains or subdomain suffixes only ────────────
+judge_denylist:
+  - "sentry.io"
+  - "amplitude.com"
+  - "pubmatic.com"
+  - "blismedia.com"
+  - "impactify.media"
+  - "doubleclick.net"
+  - "google-analytics.com"
+  - "segment.com"
+  - "segment.io"
+  - "hotjar.com"
+
 # ── Base URLs for URL resolution ─────────────────────────────────────────
 # Used by detail enrichment to resolve relative URLs scraped from sites.
 # Sites not listed here (or with null) cannot have relative URLs resolved.

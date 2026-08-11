@@ -177,6 +177,12 @@ def load_blocked_sso() -> list[str]:
     return cfg.get("blocked_sso", [])
 
 
+def load_judge_denylist() -> list[str]:
+    """Load judge denylist host substrings from sites.yaml."""
+    cfg = load_sites_config()
+    return cfg.get("judge_denylist", [])
+
+
 def load_base_urls() -> dict[str, str | None]:
     """Load site base URLs for URL resolution from sites.yaml."""
     cfg = load_sites_config()
