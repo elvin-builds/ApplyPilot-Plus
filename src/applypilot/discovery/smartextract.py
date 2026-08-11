@@ -22,7 +22,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import quote_plus, urlparse
 
 import httpx
@@ -94,6 +94,56 @@ def load_sites() -> list[dict]:
     return data.get("sites", [])
 
 
+def _registrable_domain(hostname: str | None) -> str | None:
+    """Return the last-two-label registrable domain heuristic for a hostname."""
+    if not hostname:
+        return None
+    labels = hostname.lower().split(".")
+    # This intentionally uses the last two labels only; multi-part public
+    # suffixes such as .co.uk are a known, tolerated limitation here.
+    if len(labels) >= 2:
+        return ".".join(labels[-2:])
+    return hostname.lower()
+
+
+def _job_url_pattern_context(site: str) -> tuple[re.Pattern[str] | None, str | None]:
+    """Load and compile a site's optional job URL pattern and domain context."""
+    site_cfg = next((cfg for cfg in load_sites() if cfg.get("name") == site), None)
+    if not site_cfg:
+        return None, None
+
+    pattern = site_cfg.get("job_url_pattern")
+    if not pattern:
+        return None, None
+
+    try:
+        compiled = re.compile(pattern)
+    except re.error:
+        log.warning("%s: invalid job_url_pattern %r; ignoring", site, pattern)
+        return None, None
+
+    site_domain = _registrable_domain(urlparse(site_cfg.get("url", "")).hostname)
+    return compiled, site_domain
+
+
+def _job_url_pattern_applies(url: str, site_domain: str | None) -> bool:
+    """Return whether the site's job_url_pattern should be enforced for this URL."""
+    lowered = url.lower()
+    if not lowered.startswith(("http://", "https://")):
+        return True
+    if not site_domain:
+        return False
+    return _registrable_domain(urlparse(url).hostname) == site_domain
+
+
+def _job_url_pattern_target(url: str) -> str:
+    """Extract the URL path string to test against job_url_pattern."""
+    lowered = url.lower()
+    if lowered.startswith(("http://", "https://")):
+        return urlparse(url).path
+    return url.split("#", 1)[0].split("?", 1)[0]
+
+
 def _store_jobs_filtered(
     conn: sqlite3.Connection,
     jobs: list[dict],
@@ -103,19 +153,29 @@ def _store_jobs_filtered(
     reject_locs: list[str],
 ) -> tuple[int, int]:
     """Store jobs with location filtering. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
     filtered = 0
     dropped_no_title = 0
+    dropped_bad_url_shape = 0
+    job_url_pattern, site_domain = _job_url_pattern_context(site)
 
     for job in jobs:
         url = job.get("url")
         if not url:
             continue
+        url_text = str(url)
         title = job.get("title")
         if title is None or not str(title).strip():
             dropped_no_title += 1
+            continue
+        if (
+            job_url_pattern
+            and _job_url_pattern_applies(url_text, site_domain)
+            and not job_url_pattern.search(_job_url_pattern_target(url_text))
+        ):
+            dropped_bad_url_shape += 1
             continue
         if not _location_ok(job.get("location"), accept_locs, reject_locs):
             filtered += 1
@@ -135,6 +195,13 @@ def _store_jobs_filtered(
         log.info("Filtered %d jobs (wrong location)", filtered)
     if dropped_no_title:
         log.warning("%s: dropped %d/%d records with no title", site, dropped_no_title, len(jobs))
+    if dropped_bad_url_shape:
+        log.warning(
+            "%s: dropped %d/%d records with URL not matching job_url_pattern",
+            site,
+            dropped_bad_url_shape,
+            len(jobs),
+        )
     conn.commit()
     return new, existing
 
