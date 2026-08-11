@@ -50,8 +50,9 @@ base_urls:
   "JustRemote": "https://justremote.co"
   "Arc.dev": "https://arc.dev"
   "Himalayas": "https://himalayas.app"
-  "Techstars Jobs": "https://www.techstars.com"
+  "Techstars Jobs": "https://jobs.techstars.com"
   "Randstad Canada": "https://www.randstad.ca/jobs/search/"
+  "Working Nomads": "https://www.workingnomads.com/jobs/"
 
 sites:
   # ── Searchable sites (URL includes query + location params) ──────────
@@ -179,7 +180,3 @@ sites:
   - name: "FlexJobs"
     url: "https://www.flexjobs.com/remote-jobs/computer-it"
     type: static
-
-  - name: "Otta"
-    url: "https://otta.com/jobs/all?title=software+engineer&remote=true"
-    type: search

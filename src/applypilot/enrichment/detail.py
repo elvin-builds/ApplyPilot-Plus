@@ -16,8 +16,9 @@ import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from urllib.parse import urljoin
+from datetime import UTC, datetime, timezone
+from functools import lru_cache
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -31,6 +32,8 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 # Sites that block scraping -- skip detail extraction entirely
 SKIP_DETAIL_SITES = {"glassdoor", "google", "Workopolis"}
+# Sites whose relative URLs are repaired by a later stage -- never retire these here.
+SITES_WITH_DEFERRED_URL_RESOLUTION = {"WelcomeToTheJungle"}
 
 # Module-level proxy config (set from CLI or caller)
 _PROXY_CONFIG: dict | None = None
@@ -52,6 +55,33 @@ def _load_base_urls() -> dict[str, str | None]:
     return load_base_urls()
 
 
+@lru_cache(maxsize=1)
+def _load_site_url_map() -> dict[str, str]:
+    """Load site names to configured search/list URLs from config/sites.yaml."""
+    from applypilot.config import load_sites_config
+
+    cfg = load_sites_config()
+    sites = cfg.get("sites", [])
+    return {
+        site["name"]: site["url"]
+        for site in sites
+        if isinstance(site, dict) and site.get("name") and site.get("url")
+    }
+
+
+def _derive_base_from_site_url(site: str) -> str | None:
+    """Derive scheme+host from a site's configured URL."""
+    site_url = _load_site_url_map().get(site)
+    if not site_url:
+        return None
+
+    parsed = urlparse(site_url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 def resolve_url(raw_url: str, site: str) -> str | None:
     """Resolve a stored URL to an absolute URL."""
     if not raw_url:
@@ -69,9 +99,17 @@ def resolve_url(raw_url: str, site: str) -> str | None:
     if site == "4DayWeek" and raw_url in ("/", "/jobs"):
         return None
 
-    base = _load_base_urls().get(site)
-    if not base:
-        return None
+    base_urls = _load_base_urls()
+    if site in base_urls:
+        base = base_urls[site]
+        if not base:
+            return None
+    else:
+        if not raw_url.startswith("/"):
+            return None
+        base = _derive_base_from_site_url(site)
+        if not base:
+            return None
 
     if ";jsessionid=" in raw_url:
         raw_url = raw_url.split(";jsessionid=")[0]
@@ -85,6 +123,7 @@ def resolve_all_urls(conn: sqlite3.Connection) -> dict:
     resolved = 0
     failed = 0
     already_absolute = 0
+    now = datetime.now(UTC).isoformat()
 
     for row in rows:
         url, site = row[0], row[1]
@@ -102,6 +141,11 @@ def resolve_all_urls(conn: sqlite3.Connection) -> dict:
                 resolved += 1
         else:
             failed += 1
+            if site not in SITES_WITH_DEFERRED_URL_RESOLUTION:
+                conn.execute(
+                    "UPDATE jobs SET detail_error = ?, detail_scraped_at = ? WHERE url = ?",
+                    ("unresolvable relative URL", now, url),
+                )
 
     # Also resolve relative application_urls
     app_resolved = 0
