@@ -99,10 +99,15 @@ def _store_jobs_filtered(
     new = 0
     existing = 0
     filtered = 0
+    dropped_no_title = 0
 
     for job in jobs:
         url = job.get("url")
         if not url:
+            continue
+        title = job.get("title")
+        if title is None or not str(title).strip():
+            dropped_no_title += 1
             continue
         if not _location_ok(job.get("location"), accept_locs, reject_locs):
             filtered += 1
@@ -120,6 +125,8 @@ def _store_jobs_filtered(
 
     if filtered:
         log.info("Filtered %d jobs (wrong location)", filtered)
+    if dropped_no_title:
+        log.warning("%s: dropped %d/%d records with no title", site, dropped_no_title, len(jobs))
     conn.commit()
     return new, existing
 
@@ -1207,7 +1214,20 @@ def build_scrape_targets(
                 "query": None,
             })
 
-    return targets
+    before_count = len(targets)
+    seen: set[tuple[str, str]] = set()
+    deduplicated: list[dict] = []
+    for target in targets:
+        key = (target["name"], target["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(target)
+
+    if len(deduplicated) != before_count:
+        log.info("Deduplicated scrape targets: %d -> %d", before_count, len(deduplicated))
+
+    return deduplicated
 
 
 # -- Run all sites -----------------------------------------------------------
